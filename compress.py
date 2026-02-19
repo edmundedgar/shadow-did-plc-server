@@ -28,13 +28,20 @@ uses custom semantic tags):
 
 Semantic tag compression
 ========================
-Custom CBOR tags (illegal in DAG-CBOR, so unambiguous) replace verbose
-string encodings with compact binary forms:
+All custom tags are illegal in DAG-CBOR (only tag 42 is permitted), so any
+tag other than 42 is unambiguously a compression marker. Tags 0-5 are avoided
+because common CBOR libraries interpret them semantically.
 
+Value tags (single-byte, 0xc6-0xc9):
   Tag 6 (sig):     base64url string -> raw 64 bytes
   Tag 7 (CID):     base32lower CID string -> raw 36 bytes
   Tag 8 (did:key): "did:key:z..." string -> raw 35 bytes (multicodec + key)
   Tag 9 (at://):   "at://..." string -> suffix string (strip "at://")
+
+Field name tags (single-byte, 0xca-0xd3) — used as map keys, wrapping null:
+  Tag 10: sig, 11: prev, 12: type, 13: services, 14: alsoKnownAs,
+  Tag 15: rotationKeys, 16: verificationMethods, 17: atproto_pds,
+  Tag 18: endpoint, 19: atproto
 """
 
 import base64
@@ -51,22 +58,57 @@ TAG_CID = 7
 TAG_DID_KEY = 8
 TAG_AT_URI = 9
 
-# Map field names to single-byte integer keys. Integers 0-23 encode as 1 byte
-# in CBOR, replacing string keys of 4-19 bytes each. Unknown keys pass through
-# as strings; the decompressor distinguishes by key type (int vs str).
+# Field name compression using semantic tags 10-19 (single-byte, 0xca-0xd3).
+# tag(10+i, null) replaces a string map key, using the same extension mechanism
+# as value tags so the only assumption is "non-42 tags are ours".
+# CBORTag is not hashable, so FieldNameTag is a thin hashable wrapper used as
+# the Python dict key; cbor2 encodes it as tag(N, null) via a custom encoder.
+FIELD_TAG_BASE = 10
 FIELD_NAMES = [
-    "sig",                  # 0  (saves 3 bytes)
-    "prev",                 # 1  (saves 4 bytes)
-    "type",                 # 2  (saves 4 bytes)
-    "services",             # 3  (saves 8 bytes)
-    "alsoKnownAs",          # 4  (saves 11 bytes)
-    "rotationKeys",         # 5  (saves 12 bytes)
-    "verificationMethods",  # 6  (saves 19 bytes)
-    "atproto_pds",          # 7  (saves 11 bytes)
-    "endpoint",             # 8  (saves 8 bytes)
-    "atproto",              # 9  (saves 7 bytes)
+    "sig",                  # tag 10  (saves 2 bytes net vs string)
+    "prev",                 # tag 11  (saves 3 bytes)
+    "type",                 # tag 12  (saves 3 bytes)
+    "services",             # tag 13  (saves 7 bytes)
+    "alsoKnownAs",          # tag 14  (saves 10 bytes)
+    "rotationKeys",         # tag 15  (saves 11 bytes)
+    "verificationMethods",  # tag 16  (saves 18 bytes)
+    "atproto_pds",          # tag 17  (saves 10 bytes)
+    "endpoint",             # tag 18  (saves 7 bytes)
+    "atproto",              # tag 19  (saves 6 bytes)
 ]
-FIELD_NAME_TO_ID = {name: i for i, name in enumerate(FIELD_NAMES)}
+TAG_TO_FIELD = {FIELD_TAG_BASE + i: name for i, name in enumerate(FIELD_NAMES)}
+FIELD_TO_TAG  = {name: FIELD_TAG_BASE + i for i, name in enumerate(FIELD_NAMES)}
+
+
+class FieldNameTag:
+    """Hashable dict-key wrapper that cbor2 encodes as tag(N, null)."""
+    __slots__ = ("num",)
+
+    def __init__(self, num):
+        self.num = num
+
+    def __hash__(self):
+        return self.num
+
+    def __eq__(self, other):
+        return isinstance(other, FieldNameTag) and self.num == other.num
+
+
+def _cbor_dumps(obj):
+    def default(encoder, value):
+        if isinstance(value, FieldNameTag):
+            encoder.encode(cbor2.CBORTag(value.num, None))
+        else:
+            raise cbor2.CBOREncodeTypeError(f"cannot encode {type(value)}")
+    return cbor2.dumps(obj, default=default)
+
+
+def _cbor_loads(data):
+    def tag_hook(decoder, tag):
+        if tag.tag in TAG_TO_FIELD:
+            return FieldNameTag(tag.tag)
+        return tag
+    return cbor2.loads(data, tag_hook=tag_hook)
 
 # --- Semantic tag compression ---
 
@@ -108,7 +150,8 @@ def sem_decompress_value(val):
 def sem_compress(obj):
     """Recursively apply semantic tag compression to a structure."""
     if isinstance(obj, dict):
-        return {FIELD_NAME_TO_ID.get(k, k): sem_compress(v) for k, v in obj.items()}
+        return {(FieldNameTag(FIELD_TO_TAG[k]) if k in FIELD_TO_TAG else k): sem_compress(v)
+                for k, v in obj.items()}
     if isinstance(obj, list):
         return [sem_compress(item) for item in obj]
     return sem_compress_value(obj)
@@ -119,7 +162,7 @@ def sem_decompress(obj):
     if isinstance(obj, cbor2.CBORTag):
         return sem_decompress_value(obj)
     if isinstance(obj, dict):
-        return {(FIELD_NAMES[k] if isinstance(k, int) else k): sem_decompress(v)
+        return {(TAG_TO_FIELD[k.num] if isinstance(k, FieldNameTag) else k): sem_decompress(v)
                 for k, v in obj.items()}
     if isinstance(obj, list):
         return [sem_decompress(item) for item in obj]
@@ -406,7 +449,8 @@ def _encode_diff(updates, deletes, inserts, prepends):
         diff["d"] = sorted(deletes)
     if inserts:
         diff["i"] = [[idx, sem_compress(val) if not isinstance(val, list)
-                      else [FIELD_NAME_TO_ID.get(val[0], val[0]), sem_compress(val[1])]]
+                      else [cbor2.CBORTag(FIELD_TO_TAG[val[0]], None) if val[0] in FIELD_TO_TAG
+                            else val[0], sem_compress(val[1])]]
                      for idx, vals in sorted(inserts.items())
                      for val in vals]
     if prepends:
@@ -428,7 +472,8 @@ def _decode_diff(diff):
     if "i" in diff:
         for idx, val in diff["i"]:
             if isinstance(val, list):
-                key = FIELD_NAMES[val[0]] if isinstance(val[0], int) else val[0]
+                k = val[0]
+                key = TAG_TO_FIELD[k.num] if isinstance(k, FieldNameTag) else k
                 inserts.setdefault(idx, []).append([key, sem_decompress(val[1])])
             else:
                 inserts.setdefault(idx, []).append(sem_decompress(val))
@@ -443,12 +488,12 @@ def compress(operations):
     entries = [sem_compress(operations[0])]
     for i in range(1, len(operations)):
         entries.append(_encode_diff(*compute_diff(operations[i - 1], operations[i])))
-    return cbor2.dumps(entries)
+    return _cbor_dumps(entries)
 
 
 def decompress(data):
     """Decompress a CBOR blob back to a list of original operations."""
-    entries = cbor2.loads(data)
+    entries = _cbor_loads(data)
     operations = [sem_decompress(entries[0])]
     for diff in entries[1:]:
         operations.append(apply_diff(operations[-1], *_decode_diff(diff)))
