@@ -23,7 +23,8 @@ The compressed output is a CBOR-encoded array (not valid DAG-CBOR, since it uses
 
     [ full_op, diff_1, diff_2, ... ]
 
-- full_op: The first operation, with semantic tag compression applied.
+- full_op: The first operation, with semantic tag and field name compression
+  applied. Map keys use integer IDs for known field names (see below).
 
 - diff_N: A map representing the changes from operation N-1 to operation N.
   Supported keys:
@@ -33,9 +34,9 @@ The compressed output is a CBOR-encoded array (not valid DAG-CBOR, since it uses
     "i" -> [[index, value], ...]   inserts: append to container at index
     "p" -> [[index, value], ...]   prepends: insert before element at index
 
-  For map inserts, value is [key_string, value_structure].
-  For array inserts/prepends, value is the element itself.
-  Empty keys are omitted.
+  For map inserts, value is [key, value_structure] where key is an integer
+  field name ID (if known) or a string. For array inserts/prepends, value is
+  the element itself. Empty keys are omitted.
 
 Index semantics
 ===============
@@ -50,6 +51,28 @@ to the array container and the value is the element to append.
 
 For prepend operations (arrays only), the index refers to the existing element
 before which the new element should be inserted.
+
+Field name integer keys
+=======================
+
+Known PLC field names are replaced with single-byte integer keys in all CBOR
+maps (both in full_op and in nested structures within diff values). CBOR
+integers 0–23 encode as a single byte, replacing string keys of 3–19 bytes.
+Unknown field names are left as strings; the decompressor distinguishes by
+key type (int vs str).
+
+| ID | Field name            | Saves  |
+|----|-----------------------|--------|
+|  0 | sig                   | 3 bytes |
+|  1 | prev                  | 4 bytes |
+|  2 | type                  | 4 bytes |
+|  3 | services              | 8 bytes |
+|  4 | alsoKnownAs           | 11 bytes |
+|  5 | rotationKeys          | 12 bytes |
+|  6 | verificationMethods   | 19 bytes |
+|  7 | atproto_pds           | 11 bytes |
+|  8 | endpoint              | 8 bytes |
+|  9 | atproto               | 7 bytes |
 
 Semantic-tag-based custom compression
 ======================================
