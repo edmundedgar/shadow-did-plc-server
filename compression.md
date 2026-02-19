@@ -3,21 +3,59 @@ This is a compression scheme designed for representing DID:PLC operations in a c
 The scheme has two parts, differential compression and semantic-tag-based custom compression.
 
 Differential compression
+========================
 
 - All records are CBOR-encoded.
 - The first record is represented in full.
 - The "prev" record in the second record tells us the previous version of the record. This is a "CID" which can be calculated by hashing the operation.
 - Any entry in the original record can be identified by an index. This index is created by parsing the record, and incrementing the count every time we come to any CBOR entity, for example a number, a mapping, an entry in a mapping, a field name in a mapping, a field value in a mapping, an array or an entry in an array.
-- The diff consists of changes to the first record, 
-  - update: "the value at index 123 should be "newpds.example.com".
-  - delete: "the mapping at index 123 should be removed"
-  - insert: "the specified item should be added to the end of the array at index 123"
-  - prepend: "the specified item should be added before the item at index 123"
+- All indices in a diff reference the *previous* operation's uncompressed structure.
+- The diff consists of changes to the previous record:
+  - update: "the value at index 123 should be replaced with 'newpds.example.com'"
+  - delete: "the entry at index 123 should be removed" (map entry marker or array element)
+  - insert: "the specified item should be added to the end of the container at index 123"
+  - prepend: "the specified item should be added before the element at index 123"
+
+Compressed file format
+======================
+
+The compressed output is a CBOR-encoded array (not valid DAG-CBOR, since it uses custom semantic tags):
+
+    [ full_op, diff_1, diff_2, ... ]
+
+- full_op: The first operation, with semantic tag compression applied.
+
+- diff_N: A map representing the changes from operation N-1 to operation N.
+  Supported keys:
+
+    "u" -> [[index, value], ...]   updates: replace leaf at index
+    "d" -> [index, ...]            deletes: remove map entry or array element
+    "i" -> [[index, value], ...]   inserts: append to container at index
+    "p" -> [[index, value], ...]   prepends: insert before element at index
+
+  For map inserts, value is [key_string, value_structure].
+  For array inserts/prepends, value is the element itself.
+  Empty keys are omitted.
+
+Index semantics
+===============
+
+For delete operations on maps, the index refers to the *entry marker* index
+(the implicit index between the dict itself and the key string). For arrays,
+it refers to the element's index directly.
+
+For insert operations on maps, the index refers to the dict container itself
+and the value is [key_string, value_structure]. For arrays, the index refers
+to the array container and the value is the element to append.
+
+For prepend operations (arrays only), the index refers to the existing element
+before which the new element should be inserted.
 
 Semantic-tag-based custom compression
+======================================
 
 Certain items in a DID:PLC operation are not optimally encoded for size. For example, signatures are stored as base64_url-encoded strings, when they could be binary data.
-For each piece of data that could be more efficiently encoded, we will assign a dedicated semantic tag using a value that would not normally be allowed by DAG-CBOR (but would be allowed, and might have another assigned value, in regular CBOR).
+For each piece of data that could be more efficiently encoded, we assign a dedicated semantic tag using a value that would not normally be allowed by DAG-CBOR (but would be allowed, and might have another assigned value, in regular CBOR).
 
 DAG-CBOR only permits tag 42 (IPLD CID link). Any other tag number is therefore unambiguous as a custom compression marker. We use tag numbers 6-9 so each tag encodes as a single byte (0xc6-0xc9). Tags 0-5 are avoided because common CBOR libraries interpret them semantically (datetime, timestamp, bignum, etc.).
 
