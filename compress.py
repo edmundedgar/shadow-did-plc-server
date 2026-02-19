@@ -51,6 +51,23 @@ TAG_CID = 7
 TAG_DID_KEY = 8
 TAG_AT_URI = 9
 
+# Map field names to single-byte integer keys. Integers 0-23 encode as 1 byte
+# in CBOR, replacing string keys of 4-19 bytes each. Unknown keys pass through
+# as strings; the decompressor distinguishes by key type (int vs str).
+FIELD_NAMES = [
+    "sig",                  # 0  (saves 3 bytes)
+    "prev",                 # 1  (saves 4 bytes)
+    "type",                 # 2  (saves 4 bytes)
+    "services",             # 3  (saves 8 bytes)
+    "alsoKnownAs",          # 4  (saves 11 bytes)
+    "rotationKeys",         # 5  (saves 12 bytes)
+    "verificationMethods",  # 6  (saves 19 bytes)
+    "atproto_pds",          # 7  (saves 11 bytes)
+    "endpoint",             # 8  (saves 8 bytes)
+    "atproto",              # 9  (saves 7 bytes)
+]
+FIELD_NAME_TO_ID = {name: i for i, name in enumerate(FIELD_NAMES)}
+
 # --- Semantic tag compression ---
 
 def sem_compress_value(val):
@@ -91,7 +108,7 @@ def sem_decompress_value(val):
 def sem_compress(obj):
     """Recursively apply semantic tag compression to a structure."""
     if isinstance(obj, dict):
-        return {k: sem_compress(v) for k, v in obj.items()}
+        return {FIELD_NAME_TO_ID.get(k, k): sem_compress(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [sem_compress(item) for item in obj]
     return sem_compress_value(obj)
@@ -102,7 +119,8 @@ def sem_decompress(obj):
     if isinstance(obj, cbor2.CBORTag):
         return sem_decompress_value(obj)
     if isinstance(obj, dict):
-        return {k: sem_decompress(v) for k, v in obj.items()}
+        return {(FIELD_NAMES[k] if isinstance(k, int) else k): sem_decompress(v)
+                for k, v in obj.items()}
     if isinstance(obj, list):
         return [sem_decompress(item) for item in obj]
     return obj
@@ -379,28 +397,52 @@ def apply_updates(obj, updates):
 
 # --- Compress / decompress pipeline ---
 
+def _encode_diff(updates, deletes, inserts, prepends):
+    diff = {}
+    if updates:
+        diff["u"] = [[idx, sem_compress_value(val)]
+                     for idx, val in sorted(updates.items())]
+    if deletes:
+        diff["d"] = sorted(deletes)
+    if inserts:
+        diff["i"] = [[idx, sem_compress(val) if not isinstance(val, list)
+                      else [FIELD_NAME_TO_ID.get(val[0], val[0]), sem_compress(val[1])]]
+                     for idx, vals in sorted(inserts.items())
+                     for val in vals]
+    if prepends:
+        diff["p"] = [[idx, sem_compress(val)]
+                     for idx, vals in sorted(prepends.items())
+                     for val in vals]
+    return diff
+
+
+def _decode_diff(diff):
+    updates = {}
+    deletes = set()
+    inserts = {}
+    prepends = {}
+    if "u" in diff:
+        updates = {idx: sem_decompress_value(val) for idx, val in diff["u"]}
+    if "d" in diff:
+        deletes = set(diff["d"])
+    if "i" in diff:
+        for idx, val in diff["i"]:
+            if isinstance(val, list):
+                key = FIELD_NAMES[val[0]] if isinstance(val[0], int) else val[0]
+                inserts.setdefault(idx, []).append([key, sem_decompress(val[1])])
+            else:
+                inserts.setdefault(idx, []).append(sem_decompress(val))
+    if "p" in diff:
+        for idx, val in diff["p"]:
+            prepends.setdefault(idx, []).append(sem_decompress(val))
+    return updates, deletes, inserts, prepends
+
+
 def compress(operations):
     """Compress a list of operations into a CBOR blob with semantic tags."""
     entries = [sem_compress(operations[0])]
     for i in range(1, len(operations)):
-        updates, deletes, inserts, prepends = compute_diff(
-            operations[i - 1], operations[i])
-
-        diff = {}
-        if updates:
-            diff["u"] = [[idx, sem_compress_value(val)]
-                         for idx, val in sorted(updates.items())]
-        if deletes:
-            diff["d"] = sorted(deletes)
-        if inserts:
-            diff["i"] = [[idx, sem_compress(val)]
-                         for idx, vals in sorted(inserts.items())
-                         for val in vals]
-        if prepends:
-            diff["p"] = [[idx, sem_compress(val)]
-                         for idx, vals in sorted(prepends.items())
-                         for val in vals]
-        entries.append(diff)
+        entries.append(_encode_diff(*compute_diff(operations[i - 1], operations[i])))
     return cbor2.dumps(entries)
 
 
@@ -409,23 +451,7 @@ def decompress(data):
     entries = cbor2.loads(data)
     operations = [sem_decompress(entries[0])]
     for diff in entries[1:]:
-        updates = {}
-        deletes = set()
-        inserts = {}
-        prepends = {}
-
-        if "u" in diff:
-            updates = {idx: sem_decompress_value(val) for idx, val in diff["u"]}
-        if "d" in diff:
-            deletes = set(diff["d"])
-        if "i" in diff:
-            for idx, val in diff["i"]:
-                inserts.setdefault(idx, []).append(sem_decompress(val))
-        if "p" in diff:
-            for idx, val in diff["p"]:
-                prepends.setdefault(idx, []).append(sem_decompress(val))
-
-        operations.append(apply_diff(operations[-1], updates, deletes, inserts, prepends))
+        operations.append(apply_diff(operations[-1], *_decode_diff(diff)))
     return operations
 
 

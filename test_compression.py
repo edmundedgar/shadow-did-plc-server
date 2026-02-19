@@ -5,8 +5,9 @@ Streams through a JSON dataset, groups by DID, compresses each DID's
 operation chain, verifies round-trip, and reports stats.
 
 Usage:
-    python test_compression.py                  # uses sample (fast, ~30s)
-    python test_compression.py --full           # uses full dataset (~50min)
+    python test_compression.py                  # mixed sample (fast, ~30s)
+    python test_compression.py --normal         # normal-only sample (fast)
+    python test_compression.py --full           # full dataset (~50min)
 """
 
 import json
@@ -57,6 +58,8 @@ def main():
 
     if "--full" in sys.argv:
         path = "rotation_key_changes.json"
+    elif "--normal" in sys.argv:
+        path = "rotation_key_changes_normal_sample.json"
     else:
         path = "rotation_key_changes_sample.json"
     print(f"Using {path}")
